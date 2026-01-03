@@ -353,12 +353,53 @@ def excel_set_value_safe(ws, row: int, col: int, value: Any) -> None:
         pass
     cell.Value = value
 
-def excel_find_rows(ws, start_row=3, max_scan_rows=400, template_nutzwert_col=4) -> Tuple[List[int], Optional[int]]:
+def _merged_value(cell):
+    try:
+        if cell.MergeCells:
+            return cell.MergeArea.Cells(1, 1).Value
+    except Exception:
+        pass
+    return cell.Value
+
+def safe_unmerge_and_clear(rng):
+    """
+    Excel COM: 'Dies ist bei verbundenen Zellen leider nicht möglich.'
+    kommt oft, wenn man Copy/Clear/Delete in/über Merges macht.
+    Daher: vor Copy immer Zielrange UnMerge + Clear.
+    """
+    try:
+        rng.UnMerge()
+    except Exception:
+        pass
+    try:
+        rng.Clear()
+    except Exception:
+        try:
+            rng.ClearContents()
+        except Exception:
+            pass
+
+def col_letter(col_idx: int) -> str:
+    letters = ""
+    while col_idx:
+        col_idx, rem = divmod(col_idx - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+def rewrite_sum_formula(template_formula: str, old_letter: str, new_letter: str) -> str:
+    pattern = rf"(\$?){re.escape(old_letter)}(\$?\d+)"
+    return re.sub(pattern, rf"\1{new_letter}\2", template_formula)
+
+def excel_find_rows(ws, start_row=3, max_scan_rows=800, template_nutzwert_col=4) -> Tuple[List[int], Optional[int]]:
     criteria_rows: List[int] = []
     sum_row = None
+
     for r in range(start_row, start_row + max_scan_rows):
-        a_val = ws.Cells(r, 1).Value
-        if a_val and "summe nutzwerte" in builtins.str(a_val).strip().lower():
+        a_val = _merged_value(ws.Cells(r, 1))
+        b_val = _merged_value(ws.Cells(r, 2))
+
+        text = (builtins.str(a_val) if a_val is not None else "") + " " + (builtins.str(b_val) if b_val is not None else "")
+        if "summe nutzwerte" in text.strip().lower():
             sum_row = r
 
         tmpl = ws.Cells(r, template_nutzwert_col).Formula
@@ -366,6 +407,13 @@ def excel_find_rows(ws, start_row=3, max_scan_rows=400, template_nutzwert_col=4)
             criteria_rows.append(r)
 
     return criteria_rows, sum_row
+
+def norm_key(x: Any) -> str:
+    s = "" if x is None else builtins.str(x)
+    s = s.replace("\u00A0", " ").replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    s = re.sub(r"[^a-z0-9äöüß ]+", "", s)
+    return s
 
 def read_supplier_report(report_path: Path) -> dict:
     df = pd.read_excel(report_path)
@@ -375,23 +423,26 @@ def read_supplier_report(report_path: Path) -> dict:
         if not crit or norm_text(crit) in ("nan", "none"):
             continue
         try:
-            out[crit] = int(r.get("Skalapunkte", 0))
+            pts = int(r.get("Skalapunkte", 0))
         except Exception:
-            out[crit] = 0
+            pts = 0
+        out[norm_key(crit)] = pts
     return out
 
 def match_points(rep_map: dict, template_crit: Any) -> int:
     if template_crit is None:
         return 0
-    template_crit_s = builtins.str(template_crit).strip()
-    if template_crit_s in rep_map:
-        return int(rep_map[template_crit_s])
+    k = norm_key(template_crit)
+    if not k:
+        return 0
 
-    t = template_crit_s.lower()
-    for k, v in rep_map.items():
-        kk = builtins.str(k).strip().lower()
-        if kk == t or t in kk or kk in t:
+    if k in rep_map:
+        return int(rep_map[k])
+
+    for kk, v in rep_map.items():
+        if kk in k or k in kk:
             return int(v)
+
     return 0
 
 def excel_find_supplier_column(ws, supplier_name: str, header_row=1, start_col=3, max_cols=400) -> Tuple[Optional[int], Optional[int]]:
@@ -412,6 +463,100 @@ def excel_next_free_supplier_column(ws, header_row=1, start_col=3, max_cols=400)
             return c, c + 1
         c += 2
     raise RuntimeError("Keine freie Spalte mehr in Nutzwertanalyse (max_cols erreicht).")
+
+def excel_last_used_row(ws, min_row: int = 2, max_row: int = 800) -> int:
+    last = min_row
+    for r in range(min_row, max_row + 1):
+        a = ws.Cells(r, 1).Value
+        d_formula = ws.Cells(r, 4).Formula
+        if (a is not None and str(a).strip() != "") or (d_formula is not None and str(d_formula).strip().startswith("=")):
+            last = r
+    return last
+
+def ensure_nutzwert_from_schablone(wb):
+    """
+    Wenn in 'Nutzwertanalyse' die Template-Formeln fehlen (z.B. weil nur A:B existiert),
+    wird A:D komplett aus 'Schablone' rüberkopiert (inkl. Formeln, Formate, Merge).
+    """
+    ws_n = wb.Worksheets("Nutzwertanalyse")
+    ws_s = wb.Worksheets("Schablone")
+
+    probe = ws_n.Cells(4, 4).Formula  # D4
+    if probe and builtins.str(probe).startswith("="):
+        return ws_n, ws_s
+
+    last_row = 1
+    for r in range(1, 1200):
+        v = _merged_value(ws_s.Cells(r, 1))
+        if v is None or builtins.str(v).strip() == "":
+            continue
+        last_row = r
+
+    # WICHTIG: Zielrange vorher UnMerge+Clear, sonst Copy knallt bei Merges
+    dst_all = ws_n.Range(ws_n.Cells(1, 1), ws_n.Cells(last_row, 4))
+    safe_unmerge_and_clear(dst_all)
+
+    src = ws_s.Range(ws_s.Cells(1, 1), ws_s.Cells(last_row, 4))
+    dst = ws_n.Range(ws_n.Cells(1, 1), ws_n.Cells(last_row, 4))
+    src.Copy(dst)
+
+    # Header neutralisieren
+    ws_n.Cells(1, 3).Value = ""
+    ws_n.Cells(2, 3).Value = "Bewertung"
+    ws_n.Cells(2, 4).Value = "Nutzwert"
+
+    try:
+        ws_n.Application.CutCopyMode = False
+    except Exception:
+        pass
+
+    return ws_n, ws_s
+
+def excel_apply_template_pair_from_schablone(
+    ws_nutz,
+    ws_schablone,
+    dest_bew_col: int,
+    dest_nutz_col: int,
+    template_bew_col: int = 3,
+    template_nutz_col: int = 4,
+) -> None:
+    last_row = excel_last_used_row(ws_schablone, min_row=1, max_row=1200)
+
+    src = ws_schablone.Range(
+        ws_schablone.Cells(1, template_bew_col),
+        ws_schablone.Cells(last_row, template_nutz_col),
+    )
+    dst = ws_nutz.Range(
+        ws_nutz.Cells(1, dest_bew_col),
+        ws_nutz.Cells(last_row, dest_nutz_col),
+    )
+
+    # WICHTIG: Zielrange UnMerge+Clear, sonst "bei verbundenen Zellen nicht möglich"
+    safe_unmerge_and_clear(dst)
+
+    src.Copy(dst)
+
+    try:
+        ws_nutz.Application.CutCopyMode = False
+    except Exception:
+        pass
+
+def set_sum_formula_like_template(ws, ws_schablone, sum_row: int, dest_bew_col: int, dest_nutz_col: int):
+    tmpl = ws_schablone.Cells(sum_row, 3).Formula  # C in Schablone, oft Merge C:D
+    if not tmpl or not builtins.str(tmpl).startswith("="):
+        return
+
+    old_nutz_letter = col_letter(4)  # D in Schablone
+    new_nutz_letter = col_letter(dest_nutz_col)
+    new_formula = rewrite_sum_formula(builtins.str(tmpl), old_nutz_letter, new_nutz_letter)
+
+    cell = ws.Cells(sum_row, dest_bew_col)
+    try:
+        if cell.MergeCells:
+            cell = cell.MergeArea.Cells(1, 1)
+    except Exception:
+        pass
+    cell.Formula = new_formula
 
 class ExcelApp:
     def __enter__(self):
@@ -441,12 +586,11 @@ def open_or_create_nutzwert(excel, out_path: Path, template_path: Path):
     else:
         wb = excel.Workbooks.Open(builtins.str(template_path.resolve()))
         wb.SaveAs(builtins.str(out_path.resolve()))
-    return wb, wb.Worksheets(1)
+    return wb
 
 def upsert_supplier_into_nutzwert(
     excel,
     wb,
-    ws,
     report_path: Path,
     supplier_name: str,
     start_col: int = 3,
@@ -454,13 +598,18 @@ def upsert_supplier_into_nutzwert(
     HEADER_ROW_1, HEADER_ROW_2 = 1, 2
     KRIT_COL, W_COL = 1, 2
 
-    criteria_rows, sum_row = excel_find_rows(ws, start_row=3, max_scan_rows=600, template_nutzwert_col=4)
+    ws, ws_s = ensure_nutzwert_from_schablone(wb)
+
+    criteria_rows, sum_row = excel_find_rows(ws, start_row=3, max_scan_rows=1200, template_nutzwert_col=4)
     if not criteria_rows:
-        raise RuntimeError("Keine Kriterienzeilen im Template erkannt (Formeln fehlen?).")
+        raise RuntimeError("Keine Kriterienzeilen erkannt (Template-Formeln fehlen?).")
 
     col_bew, col_nutz = excel_find_supplier_column(ws, supplier_name, header_row=HEADER_ROW_1, start_col=start_col)
     if col_bew is None:
         col_bew, col_nutz = excel_next_free_supplier_column(ws, header_row=HEADER_ROW_1, start_col=start_col)
+
+        excel_apply_template_pair_from_schablone(ws, ws_s, col_bew, col_nutz)
+
         excel_set_value_safe(ws, HEADER_ROW_1, col_bew, supplier_name)
         excel_set_value_safe(ws, HEADER_ROW_2, col_bew, "Bewertung")
         excel_set_value_safe(ws, HEADER_ROW_2, col_nutz, "Nutzwert")
@@ -468,7 +617,7 @@ def upsert_supplier_into_nutzwert(
     rep_map = read_supplier_report(report_path)
 
     for r in criteria_rows:
-        crit_txt = ws.Cells(r, KRIT_COL).Value
+        crit_txt = _merged_value(ws.Cells(r, KRIT_COL))
         pts = match_points(rep_map, crit_txt)
         ws.Cells(r, col_bew).Value = int(pts)
 
@@ -477,9 +626,7 @@ def upsert_supplier_into_nutzwert(
         ws.Cells(r, col_nutz).Formula = f"={w_cell}*{b_cell}"
 
     if sum_row:
-        first = builtins.str(ws.Cells(criteria_rows[0], col_nutz).Address).replace("$", "")
-        last = builtins.str(ws.Cells(criteria_rows[-1], col_nutz).Address).replace("$", "")
-        ws.Cells(sum_row, col_nutz).Formula = f"=SUM({first}:{last})"
+        set_sum_formula_like_template(ws, ws_s, sum_row, col_bew, col_nutz)
 
     try:
         wb.RefreshAll()
@@ -511,7 +658,6 @@ def load_erp_dict(config: Config, supplier_name: str) -> dict:
     return dict(zip(df_erp[0][1:], df_erp[1][1:]))
 
 def make_display_value(val: Any, crit_key_norm: str, keep_original: frozenset[str]) -> str:
-    # Default: original
     display_val: Any = val
 
     num = extract_first_number(val)
@@ -549,7 +695,6 @@ def process_supplier_from_xlsx(
 
         erp_dict = load_erp_dict(config, supplier_name)
 
-        # manuelle Kriterien
         val_col_candidates = [c for c in df_man.columns if "bewertung" in builtins.str(c).lower()]
         if not val_col_candidates:
             print(" [!] Konnte Bewertungsspalte im Formular-Export nicht finden.")
@@ -558,6 +703,7 @@ def process_supplier_from_xlsx(
 
         final_rows: list[dict] = []
 
+        # Manuelle Kriterien
         for _, row in df_man.iterrows():
             crit = safe_str(row.get("Kriterium"))
             if not crit or norm_text(crit) in ("nan", "none"):
@@ -617,9 +763,12 @@ def phase_dispatch_links(config: Config, api: FormAPI, outlook: OutlookUI, state
             subject = f"SCM-Bewertung | Runde {state.round_id} | {s_id}"
             body = (
                 f"Hallo {name},\n\n"
-                f"bitte füllen Sie die Lieferantenbewertung über diesen Link aus:\n\n"
+                f"im Rahmen unseres aktuellen Lieferantenbewertungsprozesses bitten wir Sie, die Bewertung über den folgenden Link auszufüllen:\n\n"
                 f"{form_url}\n\n"
-                f"Vielen Dank!\n\n"
+                f"Bitte füllen Sie die Bewertung vollständig und sorgfältig aus. Die Bearbeitung dauert in der Regel nur wenige Minuten.\n\n"
+                f"Vielen Dank für Ihre Unterstützung.\n\n"
+                f"Freundliche Grüße\n"
+                f"Ihr SCM-Team\n\n"
                 f"(Runde {state.round_id})"
             )
             outlook.new_mail(email, subject, body)
@@ -630,7 +779,6 @@ def phase_dispatch_links(config: Config, api: FormAPI, outlook: OutlookUI, state
             print(f" [OK] Link an {lname} ({s_id})")
             print(state.status_line())
         except Exception:
-            # UI Recovery: Compose schließen
             try:
                 outlook.page.keyboard.press("Escape")
             except Exception:
@@ -669,14 +817,13 @@ def phase_poll_and_process(
 
                 report_path = process_supplier_from_xlsx(config, scale_data, state.round_id, sid, file_path)
                 if report_path:
-                    # direkt inkrementell in Nutzwertanalyse updaten
                     with ExcelApp() as excel:
                         out_path = (config.folder_nutz / f"Nutzwertanalyse_R{state.round_id}.xlsx").resolve()
-                        wb, ws = open_or_create_nutzwert(excel, out_path, config.file_nutz_template)
+                        wb = open_or_create_nutzwert(excel, out_path, config.file_nutz_template)
                         try:
                             supplier_name = supplier_name_for_id(config, sid)
                             if supplier_name:
-                                upsert_supplier_into_nutzwert(excel, wb, ws, report_path, supplier_name)
+                                upsert_supplier_into_nutzwert(excel, wb, report_path, supplier_name)
                                 wb.Save()
                                 print(f"[OK] Nutzwertanalyse inkrementell aktualisiert: {out_path}")
                         finally:
@@ -695,50 +842,25 @@ def phase_poll_and_process(
             time.sleep(6)
 
 def phase_finalize_nutzwert(config: Config, state: RoundState) -> Optional[Path]:
-    # Wenn wir inkrementell updaten, ist "build" optional.
     out_path = (config.folder_nutz / f"Nutzwertanalyse_R{state.round_id}.xlsx").resolve()
     if out_path.exists():
         state.nutzwert_done = True
         state.save()
         return out_path
 
-    # Fallback: falls noch nicht existiert, aus Einzelberichten bauen
-    report_files = sorted(config.folder_final.glob(f"Bericht_*_R{state.round_id}.xlsx"))
-    if not report_files:
-        print("[!] Keine Einzelberichte gefunden – Nutzwertanalyse wird nicht erstellt.")
-        return None
-
-    if not config.file_nutz_template.exists():
-        print(f"[!] Nutzwert-Template fehlt: {config.file_nutz_template}")
-        return None
-
-    suppliers: list[Tuple[str, Path]] = []
-    for p in report_files:
-        m = re.match(r"Bericht_(.*)_R(\d+)\.xlsx", p.name, flags=re.IGNORECASE)
-        suppliers.append((m.group(1) if m else p.stem, p))
-
-    with ExcelApp() as excel:
-        wb = excel.Workbooks.Open(builtins.str(config.file_nutz_template.resolve()))
-        ws = wb.Worksheets(1)
-        try:
-            for s_name, report_path in suppliers:
-                upsert_supplier_into_nutzwert(excel, wb, ws, report_path, s_name)
-            wb.SaveAs(builtins.str(out_path))
-            state.nutzwert_done = True
-            state.save()
-            print(f"\n[FINISH] Nutzwertanalyse erstellt: {out_path}")
-            return Path(out_path)
-        finally:
-            try:
-                wb.Close(SaveChanges=True)
-            except Exception:
-                pass
-
 def phase_send_final_mail(outlook: OutlookUI, state: RoundState, to_email: str, attachment: Path) -> None:
     if state.final_mail_sent:
         return
     subject = f"SCM Nutzwertanalyse Runde {state.round_id}"
-    body = "Hi,\n\nanbei die Nutzwertanalyse.\n\nViele Grüße\nSCM Bot"
+    body = (
+        f"Hallo,\n\n"
+        f"anbei erhalten Sie die aktuelle Nutzwertanalyse zur Lieferantenbewertung (Runde {state.round_id}).\n\n"
+        f"Die Datei enthält die konsolidierten Ergebnisse aus den eingegangenen Bewertungen sowie den ERP-Daten.\n"
+        f"Bitte nutzen Sie die Auswertung als Entscheidungsgrundlage; die finale Lieferantenauswahl verbleibt bei Ihnen.\n\n"
+        f"Freundliche Grüße\n"
+        f"SCM Bot\n\n"
+        f"(Runde {state.round_id})"
+    )
     outlook.open_mail()
     outlook.new_mail_with_attachment(to_email, subject, body, attachment)
     state.final_mail_sent = True
