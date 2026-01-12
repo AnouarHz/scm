@@ -7,10 +7,13 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Optional
 
 import openpyxl
-from fastapi import FastAPI, Request, Form, HTTPException
+from fastapi import FastAPI, Request, Form, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse, Response
-from jinja2 import Template
 
+import smtplib
+from email.message import EmailMessage
+
+from starlette.templating import Jinja2Templates
 
 # ==========================================================
 # PATHS + CONFIG
@@ -33,7 +36,23 @@ SOURCE_MANUAL_VALUE = "Manuelle Bewertung"
 
 CACHE_TTL = 30
 
+# ==========================================================
+# SMTP / MAIL CONFIG (Aufgabe 3)
+# ==========================================================
+MAIL_ENABLED = os.getenv("SCM_MAIL_ENABLED", "1").strip() not in ("0", "false", "False", "no", "NO")
+MAIL_TO = os.getenv("SCM_MAIL_TO", "anouar.hizaoui001@stud.fh-dortmund.de").strip()
+
+SMTP_HOST = os.getenv("SCM_SMTP_HOST", "mail.gmx.net").strip()
+SMTP_PORT = int(os.getenv("SCM_SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SCM_SMTP_USER", "scmuser@gmx.de").strip()
+SMTP_PASS = os.getenv("SCM_SMTP_PASS", "scmuser1!").strip()
+SMTP_FROM = os.getenv("SCM_SMTP_FROM", SMTP_USER).strip()  # fallback
+
+SMTP_USE_STARTTLS = os.getenv("SCM_SMTP_STARTTLS", "1").strip() not in ("0", "false", "False", "no", "NO")
+
 app = FastAPI(title="SCM Form Backend")
+
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
 # ==========================================================
@@ -93,6 +112,59 @@ def read_token(token: str) -> Dict[str, Any]:
 
 
 # ==========================================================
+# MAIL SENDER (Aufgabe 3)
+# ==========================================================
+def send_submission_mail(round_id: str, supplier_id: str, answers: Dict[str, int]) -> None:
+    """
+    Sends an email with the XLSX submission attached.
+    Runs as BackgroundTask to keep the submit endpoint fast.
+    """
+    if not MAIL_ENABLED:
+        return
+
+    # Basic config validation (silent fail -> only server log)
+    if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and SMTP_FROM and MAIL_TO):
+        print("[MAIL] SMTP config missing (SCM_SMTP_HOST/PORT/USER/PASS/FROM or SCM_MAIL_TO). Mail not sent.")
+        return
+
+    xlsx_bytes = build_reply_xlsx(answers)
+    filename = f"Antwort_{supplier_id}_R{round_id}.xlsx"
+
+    msg = EmailMessage()
+    msg["Subject"] = f"SCM Bewertung eingegangen | Runde {round_id} | {supplier_id}"
+    msg["From"] = SMTP_FROM
+    msg["To"] = MAIL_TO
+    msg.set_content(
+        "Hallo,\n\n"
+        f"es ist eine neue Bewertung eingegangen.\n\n"
+        f"Runde: {round_id}\n"
+        f"Lieferant: {supplier_id}\n\n"
+        "Im Anhang finden Sie die exportierte Antwortdatei (XLSX).\n\n"
+        "Viele Grüße\n"
+        "SCM Formular-Service\n"
+    )
+
+    msg.add_attachment(
+        xlsx_bytes,
+        maintype="application",
+        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=filename,
+    )
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+            smtp.ehlo()
+            if SMTP_USE_STARTTLS:
+                smtp.starttls()
+                smtp.ehlo()
+            smtp.login(SMTP_USER, SMTP_PASS)
+            smtp.send_message(msg)
+        print(f"[MAIL] Sent submission mail to {MAIL_TO} ({filename}).")
+    except Exception as e:
+        print(f"[MAIL] Failed to send mail: {e}")
+
+
+# ==========================================================
 # SCALE + MANUAL CRITERIA (single pass openpyxl)
 # ==========================================================
 def _find_header(ws, header_contains: str) -> Tuple[int, int]:
@@ -126,8 +198,6 @@ def load_scale_and_manual() -> Tuple[Dict[str, Dict[int, str]], List[str]]:
     header_row, src_col = _find_header(ws, SOURCE_COL_NAME)
     crit_col = _find_col_in_row(ws, header_row, "kriter") or 1
 
-    # Annahme wie bei dir: Skala-Spalten 0..100 sitzen ab Spalte 5 (E) bis 10 (J)
-    # (Weil du vorher df.iloc[i,4..9] genutzt hast)
     scale_cols = {0: 5, 20: 6, 40: 7, 60: 8, 80: 9, 100: 10}
 
     scale: Dict[str, Dict[int, str]] = {}
@@ -140,10 +210,8 @@ def load_scale_and_manual() -> Tuple[Dict[str, Dict[int, str]], List[str]]:
         if not crit or norm(crit) in ("nan", "none"):
             continue
 
-        # Skala sammeln
         scale[crit] = {pts: clean(ws.cell(r, col).value) for pts, col in scale_cols.items()}
 
-        # Manual markieren
         src_val = ws.cell(r, src_col).value
         if norm(src_val) == manual_marker:
             manual.append(crit)
@@ -157,7 +225,6 @@ def load_scale_and_manual() -> Tuple[Dict[str, Dict[int, str]], List[str]]:
             f"Header gefunden (Row {header_row}, Col {src_col}), aber keine Zeilen mit '{SOURCE_MANUAL_VALUE}'."
         )
 
-    # unique, Reihenfolge wie Skala
     manual = list(dict.fromkeys(manual))
     return scale, manual
 
@@ -180,10 +247,9 @@ def get_scale_and_manual() -> Tuple[Dict[str, Dict[int, str]], List[str]]:
 
 
 # ==========================================================
-# XLSX Builder (für Bot)
+# XLSX Builder (für Bot + Mail)
 # ==========================================================
 def build_reply_xlsx(answers: Dict[str, int]) -> bytes:
-    # minimal: openpyxl direkt (spart pandas)
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Antwort"
@@ -194,65 +260,6 @@ def build_reply_xlsx(answers: Dict[str, int]) -> bytes:
     bio = BytesIO()
     wb.save(bio)
     return bio.getvalue()
-
-
-# ==========================================================
-# HTML Template
-# ==========================================================
-FORM_HTML = Template("""
-<!doctype html>
-<html lang="de">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>SCM Bewertung</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 24px; max-width: 980px; }
-    .meta { color:#555; margin-bottom: 16px; }
-    .card { border:1px solid #ddd; border-radius: 10px; padding: 14px; margin: 12px 0; }
-    .crit { font-weight: 700; margin-bottom: 8px; }
-    .opt { margin: 8px 0; }
-    .desc { color:#444; font-size: 13px; margin-left: 22px; white-space: pre-wrap; }
-    .btn { padding: 10px 14px; border-radius: 10px; border:0; background:#1a73e8; color:white; font-weight:700; cursor:pointer; }
-    .subtle { color:#666; font-size: 12px; }
-  </style>
-</head>
-<body>
-  <h2>SCM Bewertung</h2>
-  <div class="meta">
-    Runde: <b>{{ round_id }}</b> • Lieferant: <b>{{ supplier_id }}</b>
-  </div>
-
-  <form method="post" action="/submit">
-    <input type="hidden" name="token" value="{{ token }}"/>
-
-    {% for i, item in items %}
-      <div class="card">
-        <div class="crit">{{ item.crit }}</div>
-        {% for pts in [100,80,60,40,20,0] %}
-          <div class="opt">
-            <label>
-              <input type="radio" name="c_{{ i }}" value="{{ pts }}" required />
-              <b>{{ pts }}</b> Punkte
-            </label>
-            {% set d = item.scale.get(pts, "") %}
-            {% if d %}
-              <div class="desc">{{ d }}</div>
-            {% endif %}
-          </div>
-        {% endfor %}
-      </div>
-    {% endfor %}
-
-    <button class="btn" type="submit">Absenden</button>
-    <div class="subtle" style="margin-top:10px;">
-      Nach dem Absenden werden die Daten serverseitig gespeichert. Der Bot holt sie automatisch ab.
-    </div>
-  </form>
-</body>
-</html>
-""")
-
 
 # ==========================================================
 # Storage
@@ -295,21 +302,28 @@ async def issue_link(supplier_id: str, round_id: str):
     return JSONResponse({"url": url, "token": token})
 
 @app.get("/evaluate", response_class=HTMLResponse)
-async def evaluate(token: str):
+async def evaluate(request: Request, token: str):
     payload = read_token(token)
     scale, manual = get_scale_and_manual()
 
     items = [{"crit": c, "scale": scale[c]} for c in manual]
-    html = FORM_HTML.render(
-        token=token,
-        round_id=payload["round_id"],
-        supplier_id=payload["supplier_id"],
-        items=list(enumerate(items)),
+    return templates.TemplateResponse(
+        "form.html",
+        {
+            "request": request,
+            "token": token,
+            "round_id": payload["round_id"],
+            "supplier_id": payload["supplier_id"],
+            "items": list(enumerate(items)),
+        },
     )
-    return HTMLResponse(html)
 
 @app.post("/submit", response_class=HTMLResponse)
-async def submit(request: Request, token: str = Form(...)):
+async def submit(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    token: str = Form(...),
+):
     payload = read_token(token)
     scale, manual = get_scale_and_manual()
 
@@ -326,6 +340,10 @@ async def submit(request: Request, token: str = Form(...)):
         answers[crit] = pts
 
     save_submission(payload["round_id"], payload["supplier_id"], answers)
+
+    # ✅ Aufgabe 3: Mail automatisch senden (asynchron im Hintergrund)
+    background_tasks.add_task(send_submission_mail, payload["round_id"], payload["supplier_id"], answers)
+
     return HTMLResponse(
         f"""
         <h3>Danke! ✅</h3>

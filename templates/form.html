@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>SCM Bewertung</title>
+  <style>
+    *{box-sizing:border-box}
+    body{font-family:Arial, sans-serif; margin:24px}
+    h2{margin:0 0 8px}
+    .meta{color:#555; margin:0 0 16px}
+
+    .panel{border:1px solid #ddd; border-radius:10px; overflow:auto}
+    table{width:100%; border-collapse:separate; border-spacing:0; min-width:1100px}
+    th, td{border-bottom:1px solid #eee; padding:10px; vertical-align:top}
+    th{
+      background:#fafafa;
+      position:sticky; top:0; z-index:3;
+      font-size:12px; text-align:center;
+    }
+    th.left{
+      text-align:left;
+      position:sticky; left:0; z-index:4;
+      min-width:260px;
+    }
+    td.left{
+      position:sticky; left:0; z-index:2;
+      background:#fff;
+      min-width:260px;
+    }
+
+    .crit{font-weight:700; margin-bottom:6px}
+    .cell{
+      border:1px solid #e6e6e6;
+      border-radius:10px;
+      padding:10px;
+      min-height:92px;
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+      justify-content:space-between;
+      background:#fff;
+    }
+    .desc{
+      color:#444;
+      font-size:12.5px;
+      white-space:pre-wrap;
+      line-height:1.25;
+    }
+    .pick{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      justify-content:flex-start;
+      font-size:12px;
+      color:#333;
+    }
+    input[type="radio"]{transform:scale(1.15)}
+    .btn{margin-top:14px; padding:10px 14px; border-radius:10px; border:0; background:#1a73e8; color:white; font-weight:700; cursor:pointer}
+    .subtle{color:#666; font-size:12px; margin-top:10px}
+
+    /* Optional: highlight chosen cell (CSS only via :has, works in modern Chromium) */
+    tr:has(input[type="radio"]:checked) td .cell{opacity:.85}
+    td:has(input[type="radio"]:checked) .cell{
+      border-color:#1a73e8;
+      box-shadow:0 0 0 2px rgba(26,115,232,.15) inset;
+      opacity:1;
+    }
+  </style>
+</head>
+<body>
+  <h2>SCM Bewertung</h2>
+  <div class="meta">Runde: <b>{{ round_id }}</b> • Lieferant: <b>{{ supplier_id }}</b></div>
+
+  <form method="post" action="/submit">
+    <input type="hidden" name="token" value="{{ token }}"/>
+
+    <div class="panel">
+      <table>
+        <thead>
+          <tr>
+            <th class="left">Kriterium</th>
+            {% for pts in [0, 20, 40, 60, 80, 100] %}
+              <th>{{ pts }}</th>
+            {% endfor %}
+          </tr>
+        </thead>
+
+        <tbody>
+          {% for i, item in items %}
+            <tr>
+              <td class="left">
+                <div class="crit">{{ item.crit }}</div>
+              </td>
+
+              {% for pts in [0, 20, 40, 60, 80, 100] %}
+                {% set d = item.scale.get(pts, "") %}
+                <td>
+                  <label class="cell">
+                    <div class="desc">{{ d }}</div>
+                    <div class="pick">
+                      <input type="radio" name="c_{{ i }}" value="{{ pts }}" required>
+                    </div>
+                  </label>
+                </td>
+              {% endfor %}
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <button class="btn" type="submit">Absenden</button>
+    <div class="subtle">
+      Nach dem Absenden werden die Daten serverseitig gespeichert.
+    </div>
+  </form>
+</body>
+</html>
