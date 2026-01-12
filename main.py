@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os, re, time, json, random, string, builtins, traceback
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Dict, Tuple, List
 
@@ -24,14 +23,19 @@ class Config:
     folder_in: Path = field(init=False)
     folder_final: Path = field(init=False)
     folder_nutz: Path = field(init=False)
+    folder_kons: Path = field(init=False)  # ✅ NEU: eigener Ordner
 
     file_suppliers: Path = field(init=False)
     file_erp: Path = field(init=False)
     file_scale: Path = field(init=False)
-    file_nutz_template: Path = field(init=False)
 
-    # ✅ zentral (rundenübergreifend)
+    # Nutzwertanalyse Template + Master
+    file_nutz_template: Path = field(init=False)
     file_nutz_master: Path = field(init=False)
+
+    # Konsolidierung Template + Master (NEU)
+    file_kons_template: Path = field(init=False)
+    file_kons_master: Path = field(init=False)
 
     form_server: str = field(default_factory=lambda: os.getenv("SCM_FORM_SERVER", "http://localhost:8000"))
     send_to_final: str = "anouar97@gmx.de"
@@ -44,15 +48,23 @@ class Config:
         object.__setattr__(self, "folder_final", self.root / "Einzelberichte_Lieferanten")
         object.__setattr__(self, "folder_nutz", self.root / "Nutzwertanalyse")
 
+        # ✅ Konsolidierung-Ordner
+        object.__setattr__(self, "folder_kons", self.root / "Konsolidierung")
+
         object.__setattr__(self, "file_suppliers", self.root / "1. SCM-Anwendungen(MA)_Lieferantenuebersicht.xlsx")
         object.__setattr__(self, "file_erp", self.root / "4. SCM-Anwendungen(MA)_ERP-System.xlsx")
         object.__setattr__(self, "file_scale", self.root / "3. SCM-Anwendungen(MA)_Gesamtbewertung.xlsx")
-        object.__setattr__(self, "file_nutz_template", self.root / "5. SCM-Nutzwertanalyse.xlsx")
 
+        object.__setattr__(self, "file_nutz_template", self.root / "5. SCM-Nutzwertanalyse.xlsx")
         object.__setattr__(self, "file_nutz_master", self.folder_nutz / "Nutzwertanalyse_Zentral.xlsx")
 
+        # ✅ neue Konsolidierung (separate Datei)
+        object.__setattr__(self, "file_kons_template", self.root / "6. SCM-Konsolidierung.xlsx")
+        # ✅ Master liegt im Ordner "Konsolidierung"
+        object.__setattr__(self, "file_kons_master", self.folder_kons / "Konsolidierung_Zentral.xlsx")
+
     def ensure_dirs(self):
-        for d in (self.folder_in, self.folder_final, self.folder_nutz):
+        for d in (self.folder_in, self.folder_final, self.folder_nutz, self.folder_kons):
             d.mkdir(parents=True, exist_ok=True)
 
 
@@ -117,9 +129,6 @@ class State:
         return f"[STATUS] {got} von {len(self.sent)} Antworten (mind. 1x, Runde {self.round_id})"
 
     def start_new_round(self) -> None:
-        """
-        ✅ Sauberer Neustart einer Runde (ohne dass Ordner-Dateien irgendwas “überschreiben”).
-        """
         self.round_id = "".join(random.choices(string.digits, k=8))
         self.sent = {}
         self.responses = {}
@@ -127,17 +136,13 @@ class State:
         self.save()
 
     def ensure_not_stuck_on_finished_round(self) -> None:
-        """
-        ✅ Wenn eine alte Runde abgeschlossen ist, starte automatisch eine neue Runde.
-        Dadurch verhindern wir, dass alte Dateien / alte responses den neuen Lauf sofort beenden.
-        """
         if self.sent and self.all_done():
             print(f"[INFO] Vorherige Runde {self.round_id} ist abgeschlossen -> starte neue Runde.")
             self.start_new_round()
 
 
 # =========================
-# STARTUP INPUT: Quartal + Jahr
+# STARTUP INPUT: MONAT + JAHR
 # =========================
 
 def _ask_int(prompt: str) -> int:
@@ -148,28 +153,43 @@ def _ask_int(prompt: str) -> int:
         except Exception:
             print("[EINGABE] Bitte eine Zahl eingeben.")
 
-def prompt_quarter_year() -> Tuple[int, int]:
-    """
-    Fragt zu Beginn interaktiv Quartal (1-4) und Jahr ab.
-    """
+def prompt_month_year() -> Tuple[int, int]:
     print("\n==============================")
     print("Nutzwertanalyse: Zeitraum wählen")
     print("==============================")
     while True:
-        q = _ask_int("Quartal (1-4): ")
-        if q in (1, 2, 3, 4):
+        m = _ask_int("Monat (1-12): ")
+        if 1 <= m <= 12:
             break
-        print("[EINGABE] Quartal muss 1, 2, 3 oder 4 sein.")
+        print("[EINGABE] Monat muss zwischen 1 und 12 sein.")
     while True:
         y = _ask_int("Jahr (z.B. 2026): ")
         if 2000 <= y <= 2100:
             break
         print("[EINGABE] Jahr muss zwischen 2000 und 2100 liegen.")
-    print(f"[OK] Zeitraum gesetzt: Q{q} {y}\n")
-    return q, y
+    print(f"[OK] Zeitraum gesetzt: {m:02d} / {y}\n")
+    return m, y
 
-def sheet_name_from_qy(q: int, y: int) -> str:
-    return f"Q{q} {y}"
+INVALID_SHEET_CHARS = r'[:\\/*?\[\]]'
+
+def sanitize_sheet_name(name: str, *, fallback: str = "Sheet") -> str:
+    if name is None:
+        return fallback
+    s = builtins.str(name).strip()
+    s = re.sub(INVALID_SHEET_CHARS, "-", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        s = fallback
+    if len(s) > 31:
+        s = s[:31].rstrip()
+    return s
+
+def sheet_name_from_my(m: int, y: int) -> str:
+    # Excel-Blattname: kein "/" (z.B. 01-2026)
+    return sanitize_sheet_name(f"{m:02d}-{y}")
+
+def month_label_from_my(m: int, y: int) -> str:
+    return f"{m:02d} / {y}"
 
 
 # =========================
@@ -381,7 +401,7 @@ def list_round_answer_files(cfg: Config, rid: str) -> Dict[str, Path]:
 
 
 # =========================
-# EXCEL / Nutzwertanalyse (zentral + sheet pro Quartal/Jahr)
+# EXCEL / Nutzwertanalyse (zentral + sheet pro Monat/Jahr)
 # =========================
 
 def _merged_value(cell):
@@ -537,6 +557,7 @@ def open_or_create_master(excel, master_path: Path, template_path: Path):
     return wb
 
 def ensure_sheet_from_template(wb, sheet_name: str):
+    sheet_name = sanitize_sheet_name(sheet_name)
     for ws in wb.Worksheets:
         try:
             if builtins.str(ws.Name).strip().lower() == sheet_name.strip().lower():
@@ -573,11 +594,8 @@ def ensure_sheet_from_template(wb, sheet_name: str):
 
     return ws_new
 
-COM_BUSY_HRESULTS = {
-    -2147418111,
-    -2147417846,
-    -2147220995,
-}
+
+COM_BUSY_HRESULTS = {-2147418111, -2147417846, -2147220995}
 
 def com_call_with_retry(fn, *, tries: int = 9, base_sleep: float = 0.35, label: str = "COM"):
     last_exc = None
@@ -593,7 +611,12 @@ def com_call_with_retry(fn, *, tries: int = 9, base_sleep: float = 0.35, label: 
             raise
     raise last_exc if last_exc else RuntimeError(f"{label}: Unbekannter Fehler")
 
-def upsert_into_master_nutz(cfg: Config, report_xlsx: Path, supplier_name_: str, sheet_name: str) -> Path:
+
+def upsert_into_master_nutz(cfg: Config, report_xlsx: Path, supplier_name_: str, sheet_name: str) -> Tuple[Path, Optional[float]]:
+    """
+    Schreibt Supplier-Spalten ins Monatsblatt.
+    Gibt zusätzlich die 'Summe Nutzwerte' (Bewertungs-Spalte) zurück.
+    """
     master_path = cfg.file_nutz_master.resolve()
 
     def _do_update():
@@ -651,8 +674,16 @@ def upsert_into_master_nutz(cfg: Config, report_xlsx: Path, supplier_name_: str,
                 except Exception:
                     pass
 
+                sum_val = None
+                if sum_row:
+                    try:
+                        v = ws.Cells(int(sum_row), int(col_bew)).Value
+                        sum_val = float(v) if v is not None and builtins.str(v).strip() != "" else None
+                    except Exception:
+                        sum_val = None
+
                 wb.Save()
-                return master_path
+                return master_path, sum_val
 
             finally:
                 try:
@@ -665,8 +696,201 @@ def upsert_into_master_nutz(cfg: Config, report_xlsx: Path, supplier_name_: str,
             except Exception:
                 pass
 
-    result = com_call_with_retry(_do_update, tries=9, base_sleep=0.35, label="Excel/Nutzwertanalyse_Master")
-    print(f"[OK] Master-Nutzwertanalyse aktualisiert: {Path(result).name} (Sheet: {sheet_name})")
+    result_path, sum_val = com_call_with_retry(_do_update, tries=9, base_sleep=0.35, label="Excel/Nutzwertanalyse_Master")
+    print(f"[OK] Master-Nutzwertanalyse aktualisiert: {Path(result_path).name} (Sheet: {sheet_name})")
+    return Path(result_path), sum_val
+
+
+# =========================
+# KONSOLIDIERUNG (FIX): TEMPLATE NIE ÜBERSCHREIBEN, SCHABLONE BLEIBT IM MASTER
+# =========================
+
+def open_or_create_kons_master(excel, kons_master_path: Path, kons_template_path: Path):
+    """
+    Öffnet immer das MASTER.
+    Wenn Master fehlt: aus Template erzeugen (SaveAs).
+    Danach wird NUR das Master bearbeitet.
+    """
+    kons_master_path.parent.mkdir(parents=True, exist_ok=True)
+    if kons_master_path.exists():
+        return excel.Workbooks.Open(builtins.str(kons_master_path.resolve()))
+
+    if not kons_template_path.exists():
+        raise RuntimeError(f"Konsolidierungs-Template fehlt: {kons_template_path}")
+
+    wb = excel.Workbooks.Open(builtins.str(kons_template_path.resolve()))
+    wb.SaveAs(builtins.str(kons_master_path.resolve()))
+    return wb
+
+def ensure_template_sheet_exists(wb, template_sheet_name: str = "Schablone"):
+    for ws in wb.Worksheets:
+        if builtins.str(ws.Name).strip().lower() == template_sheet_name.lower():
+            return ws
+    raise RuntimeError(f"In '{Path(wb.FullName).name}' muss ein Blatt '{template_sheet_name}' existieren.")
+
+def ensure_unique_sheet_name(wb, base_name: str) -> str:
+    name = sanitize_sheet_name(base_name, fallback="Lieferant")
+    existing = {builtins.str(ws.Name).strip().lower() for ws in wb.Worksheets}
+
+    if name.strip().lower() == "schablone":
+        name = "Schablone_1"
+
+    if name.lower() not in existing:
+        return name
+
+    for i in range(2, 200):
+        cand = sanitize_sheet_name(f"{name[:28]}_{i}", fallback=f"Lieferant_{i}")
+        if cand.lower() not in existing and cand.lower() != "schablone":
+            return cand
+
+    raise RuntimeError("Konnte keinen eindeutigen Blattnamen erzeugen (zu viele Kollisionen).")
+
+def ensure_supplier_sheet_from_kons_template(wb, supplier_name_: str, template_sheet_name: str = "Schablone") -> Any:
+    """
+    ✅ NICHT ws_t.Copy() (das kann Excel/COM manchmal so "verschieben", dass es wie Überschreiben wirkt).
+    ✅ Stattdessen: neues Blatt anlegen und UsedRange aus 'Schablone' kopieren.
+    'Schablone' bleibt IMMER erhalten.
+    """
+    supplier_real = builtins.str(supplier_name_).strip()
+    target_name = sanitize_sheet_name(supplier_real, fallback="Lieferant")
+
+    # existiert bereits?
+    for ws in wb.Worksheets:
+        try:
+            if builtins.str(ws.Name).strip().lower() == target_name.lower():
+                ws.Cells(1, 1).Value = supplier_real
+                return ws
+        except Exception:
+            continue
+
+    ws_tpl = ensure_template_sheet_exists(wb, template_sheet_name=template_sheet_name)
+
+    # Zielname (falls Kollision)
+    target_name = ensure_unique_sheet_name(wb, target_name)
+
+    # Neues Blatt
+    ws_new = wb.Worksheets.Add(After=wb.Worksheets(wb.Worksheets.Count))
+    ws_new.Name = target_name
+
+    # Template-Inhalt kopieren (UsedRange)
+    try:
+        src = ws_tpl.UsedRange
+        dst = ws_new.Range(ws_new.Cells(1, 1), ws_new.Cells(src.Rows.Count, src.Columns.Count))
+        dst.Clear()
+        src.Copy(dst)
+        try:
+            wb.Application.CutCopyMode = False
+        except Exception:
+            pass
+    except Exception:
+        # Fallback (falls UsedRange zickt)
+        src = ws_tpl.Range("A1:Z50")
+        dst = ws_new.Range("A1:Z50")
+        dst.Clear()
+        src.Copy(dst)
+        try:
+            wb.Application.CutCopyMode = False
+        except Exception:
+            pass
+
+    ws_new.Cells(1, 1).Value = supplier_real
+    return ws_new
+
+def find_or_create_period_column(ws, period: str, row_period: int = 2, start_col: int = 2, max_cols: int = 400) -> int:
+    period = builtins.str(period).strip()
+
+    for c in range(start_col, max_cols + 1):
+        v = ws.Cells(row_period, c).Value
+        if v and builtins.str(v).strip() == period:
+            return c
+
+    for c in range(start_col, max_cols + 1):
+        v = ws.Cells(row_period, c).Value
+        if v is None or builtins.str(v).strip() == "":
+            ws.Cells(row_period, c).Value = period
+            return c
+
+    raise RuntimeError("Keine freie Spalte mehr in Konsolidierung (max_cols erreicht).")
+
+def last_used_period_col(ws, row_period: int = 2, start_col: int = 2, max_cols: int = 400) -> int:
+    last = start_col - 1
+    for c in range(start_col, max_cols + 1):
+        v = ws.Cells(row_period, c).Value
+        if v is not None and builtins.str(v).strip() != "":
+            last = c
+    return last
+
+def update_supplier_konsolidierung(cfg: Config, supplier_name_: str, period: str, value: Optional[float]) -> Path:
+    """
+    Schreibt/ergänzt pro Lieferant:
+    - A1 = Lieferantenname (echter Name)
+    - Row2: Zeiträume (B2..)
+    - Row3: Werte (B3..)
+    - B5: arithm. Mittel über Zeile 3 (alle Werte)
+    """
+    kons_master_path = cfg.file_kons_master.resolve()
+    kons_template_path = cfg.file_kons_template.resolve()
+
+    def _do_update():
+        excel = win32.Dispatch("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        try:
+            try:
+                excel.ScreenUpdating = False
+            except Exception:
+                pass
+            try:
+                excel.Calculation = -4105
+            except Exception:
+                pass
+
+            wb = open_or_create_kons_master(excel, kons_master_path, kons_template_path)
+            try:
+                # ✅ WICHTIG: wir arbeiten NUR im Master!
+                ws = ensure_supplier_sheet_from_kons_template(wb, supplier_name_, template_sheet_name="Schablone")
+
+                col = find_or_create_period_column(ws, period, row_period=2, start_col=2, max_cols=400)
+
+                if value is None:
+                    ws.Cells(3, col).Value = ""
+                else:
+                    ws.Cells(3, col).Value = float(value)
+
+                last_col = last_used_period_col(ws, row_period=2, start_col=2, max_cols=400)
+                if last_col >= 2:
+                    start_cell = ws.Cells(3, 2).Address.replace("$", "")
+                    end_cell = ws.Cells(3, last_col).Address.replace("$", "")
+                    rng = f"{start_cell}:{end_cell}"
+                    ws.Cells(5, 2).Formula = f'=IF(COUNT({rng})=0,"",AVERAGE({rng}))'
+                else:
+                    ws.Cells(5, 2).Formula = ""
+
+                try:
+                    wb.RefreshAll()
+                except Exception:
+                    pass
+                try:
+                    excel.CalculateFull()
+                except Exception:
+                    pass
+
+                wb.Save()
+                return kons_master_path
+
+            finally:
+                try:
+                    wb.Close(SaveChanges=True)
+                except Exception:
+                    pass
+        finally:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
+
+    result = com_call_with_retry(_do_update, tries=9, base_sleep=0.35, label="Excel/Konsolidierung_Supplier")
+    print(f"[OK] Konsolidierung aktualisiert: {Path(result).name} | {supplier_name_} | {period}")
     return Path(result)
 
 
@@ -692,7 +916,7 @@ class OutlookUI:
         self.page.click('button[aria-label*="Senden"]')
         self.page.wait_for_selector('div[aria-label="An"]', state="hidden", timeout=30000)
 
-    def new_mail_with_attachment(self, to_email: str, subject: str, body: str, attachment_path: Path) -> None:
+    def new_mail_with_attachments(self, to_email: str, subject: str, body: str, attachment_paths: List[Path]) -> None:
         self.page.click('button[aria-label*="Neue"]')
         self.page.wait_for_timeout(500)
         self.page.fill('div[aria-label="An"]', to_email)
@@ -700,12 +924,16 @@ class OutlookUI:
         self.page.locator('div[role="textbox"]').first.click()
         self.page.keyboard.type(body)
 
-        self.page.locator('button[aria-label*="Datei anfügen"]').first.click()
-        with self.page.expect_file_chooser() as fc:
-            self.page.locator('button[aria-label*="Diesen Computer durchsuchen"]').first.click()
-        fc.value.set_files(str(attachment_path.resolve()))
+        for ap in attachment_paths:
+            if not ap or not Path(ap).exists():
+                continue
 
-        self.page.wait_for_timeout(1200)
+            self.page.locator('button[aria-label*="Datei anfügen"]').first.click()
+            with self.page.expect_file_chooser() as fc:
+                self.page.locator('button[aria-label*="Diesen Computer durchsuchen"]').first.click()
+            fc.value.set_files(str(Path(ap).resolve()))
+            self.page.wait_for_timeout(1200)
+
         self.page.click('button[aria-label*="Senden"]')
         self.page.wait_for_selector('div[aria-label="An"]', state="hidden", timeout=30000)
 
@@ -847,7 +1075,9 @@ def phase_send_links(cfg: Config, outlook: OutlookUI, st: State):
 def ingest_existing_round_answers(cfg: Config, scale: dict, st: State, sheet_name: str) -> None:
     """
     ✅ Scannt NUR auf st.round_id.
-    Und schreibt Nutzwerte in das vorab gewählte Sheet (Qx YYYY).
+    - erstellt Bericht
+    - schreibt ins Nutzwert-Master Monatsblatt
+    - aktualisiert Konsolidierung pro Lieferant in separater Datei
     """
     if not st.sent:
         return
@@ -875,7 +1105,13 @@ def ingest_existing_round_answers(cfg: Config, scale: dict, st: State, sheet_nam
 
         sup = supplier_name(cfg, sid)
         if sup:
-            upsert_into_master_nutz(cfg, report, sup, sheet_name)
+            _, sum_val = upsert_into_master_nutz(cfg, report, sup, sheet_name)
+
+            try:
+                update_supplier_konsolidierung(cfg, sup, sheet_name, sum_val)
+            except Exception as e:
+                print(f"[WARN] Konsolidierung konnte nicht aktualisiert werden ({sup}): {e}")
+                traceback.print_exc()
 
         prev_count = int(meta.get("count", 0))
         st.responses[sid] = {
@@ -977,7 +1213,12 @@ def phase_poll_folder(cfg: Config, outlook: OutlookUI, scale: dict, st: State, s
 
                 sup = supplier_name(cfg, sid)
                 if sup:
-                    upsert_into_master_nutz(cfg, report, sup, sheet_name)
+                    _, sum_val = upsert_into_master_nutz(cfg, report, sup, sheet_name)
+                    try:
+                        update_supplier_konsolidierung(cfg, sup, sheet_name, sum_val)
+                    except Exception as e:
+                        print(f"[WARN] Konsolidierung konnte nicht aktualisiert werden ({sup}): {e}")
+                        traceback.print_exc()
 
                 prev_meta = st.responses.get(sid) or {}
                 st.responses[sid] = {
@@ -1010,24 +1251,38 @@ def phase_send_final(cfg: Config, outlook: OutlookUI, st: State, sheet_name: str
     if st.final_mail_sent:
         return
 
-    attach = cfg.file_nutz_master.resolve()
-    if not attach.exists():
-        print("[WARN] Keine zentrale Nutzwertanalyse-Datei gefunden, keine Abschlussmail.")
+    attach_nutz = cfg.file_nutz_master.resolve()
+    attach_kons = cfg.file_kons_master.resolve()
+
+    attachments: List[Path] = []
+    if attach_nutz.exists():
+        attachments.append(attach_nutz)
+    else:
+        print("[WARN] Keine zentrale Nutzwertanalyse-Datei gefunden.")
+
+    if attach_kons.exists():
+        attachments.append(attach_kons)
+    else:
+        print("[WARN] Keine Konsolidierung-Datei gefunden (Konsolidierung_Zentral.xlsx).")
+
+    if not attachments:
+        print("[WARN] Keine Anhänge vorhanden, keine Abschlussmail.")
         return
 
     subject = f"SCM Nutzwertanalyse | {sheet_name} | Runde {st.round_id}"
     body = (
         f"Hallo,\n\n"
-        f"anbei die zentrale Nutzwertanalyse.\n"
-        f"Das gewählte Blatt ist: {sheet_name}\n"
+        f"anbei die zentrale Nutzwertanalyse sowie die Lieferanten-Konsolidierung.\n"
+        f"Bewertungszeitraum: {sheet_name}\n"
         f"(Runde {st.round_id})\n\n"
         f"Grüße\nSCM Bot"
     )
+
     outlook.open_mail()
-    outlook.new_mail_with_attachment(cfg.send_to_final, subject, body, attach)
+    outlook.new_mail_with_attachments(cfg.send_to_final, subject, body, attachments)
     st.final_mail_sent = True
     st.save()
-    print(f"[FINISH] Abschlussmail gesendet an {cfg.send_to_final} (Anhang: {attach.name})")
+    print(f"[FINISH] Abschlussmail gesendet an {cfg.send_to_final} (Anhänge: {', '.join(p.name for p in attachments)})")
 
 
 # =========================
@@ -1038,13 +1293,10 @@ def main():
     cfg = Config()
     cfg.ensure_dirs()
 
-    # ✅ 1) Erst Zeitraum abfragen (statt Systemzeit)
-    q, y = prompt_quarter_year()
-    sheet_name = sheet_name_from_qy(q, y)
+    m, y = prompt_month_year()
+    sheet_name = sheet_name_from_my(m, y)  # z.B. 01-2026
 
     st = State.load_or_new(cfg)
-
-    # ✅ 2) dann Runden-Logik
     st.ensure_not_stuck_on_finished_round()
 
     scale = load_scale(cfg.file_scale)
