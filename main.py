@@ -36,7 +36,7 @@ class Config:
     file_kons_master: Path = field(init=False)
 
     form_server: str = field(default_factory=lambda: os.getenv("SCM_FORM_SERVER", "http://localhost:8000"))
-    send_to_final: str = "anouar97@gmx.de"
+    send_to_final: str = "scmemployee@gmx.de"
 
     keep_original_text_fields: frozenset[str] = frozenset({"co2-emissionen", "zahlungsbedingungen"})
 
