@@ -232,10 +232,9 @@ def first_num_thousands_safe(v: Any) -> Optional[float]:
 
     # If it looks like german thousands: 12.000 or 1.234.567 or 12.000,50
     if re.fullmatch(r"[-+]?\d{1,3}(\.\d{3})+(,\d+)?", t):
-        t = t.replace(".", "")  # remove thousand dots
-        t = t.replace(",", ".")  # decimal comma -> dot
+        t = t.replace(".", "")
+        t = t.replace(",", ".")
     else:
-        # normal handling
         t = t.replace(",", ".")
 
     m = re.search(r"[-+]?\d*\.\d+|\d+", t)
@@ -250,14 +249,11 @@ def erp_points(crit: str, v: Any, scale: dict) -> int:
     if ("iso " in kl or kl.startswith("iso ")) and is_no(v):
         return 0
 
-    # ✅ CO2 erkennen
     is_co2 = ("co2" in kl and "emission" in kl)
 
-    # ✅ CO2: tausender-sicher parsen; sonst wie bisher
     num = first_num_thousands_safe(v) if is_co2 else first_num(v)
 
     if num is not None:
-        # ✅ CO2: Rohwert (kg) nutzen; sonst Prozent-Logik wie bisher
         value_for_scale = float(num) if is_co2 else as_percent(float(num))
 
         for pts in (100, 80, 60, 40, 20, 0):
@@ -853,15 +849,13 @@ def apply_trafficlight_to_nutz_sheet(cfg: Config, sheet_name: str, start_cell: s
                     if v is not None and builtins.str(v).strip() != "":
                         last_col = max(last_col, c + 1)  # include Nutzwert-Spalte
                 if last_col < 3:
-                    # Nichts zu formatieren
                     wb.Save()
                     return master_path
 
                 # --- letzte genutzte Zeile bestimmen ---
-                # nutze deine bestehende helper-funktion:
                 last_row = excel_last_used_row(ws, min_row=31, max_row=1200)
 
-                # Startcell parsen (C31 -> row/col)
+                # Startcell parsen C31
                 start_rng = ws.Range(start_cell)
                 start_row = start_rng.Row
                 start_col = start_rng.Column
@@ -869,7 +863,6 @@ def apply_trafficlight_to_nutz_sheet(cfg: Config, sheet_name: str, start_cell: s
                 # Zielbereich
                 rng = ws.Range(ws.Cells(start_row, start_col), ws.Cells(last_row, last_col))
 
-                # Vorhandene CF im Bereich löschen (damit es nicht stapelt)
                 try:
                     rng.FormatConditions.Delete()
                 except Exception:
@@ -879,20 +872,14 @@ def apply_trafficlight_to_nutz_sheet(cfg: Config, sheet_name: str, start_cell: s
                 fc = rng.FormatConditions.AddColorScale(3)
                 cs = fc.ColorScaleCriteria
 
-                # Min (Rot), Mid (Gelb), Max (Grün)
-                # Type=1 entspricht xlConditionValueLowestValue / Percentile etc. ist versionabhängig,
-                # aber Excel COM akzeptiert diese Werte zuverlässig:
-                # 1 = LowestValue, 2 = HighestValue, 5 = Percentile
                 try:
                     cs(1).Type = 1  # LowestValue
                     cs(2).Type = 5  # Percentile
                     cs(2).Value = 50
                     cs(3).Type = 2  # HighestValue
                 except Exception:
-                    # fallback: lasse Types wie default und setze nur Farben
                     pass
 
-                # Farben setzen (RGB)
                 cs(1).FormatColor.Color = 255  # Rot   (RGB(255,0,0))
                 cs(2).FormatColor.Color = 65535  # Gelb  (RGB(255,255,0))
                 cs(3).FormatColor.Color = 65280  # Grün  (RGB(0,255,0))
