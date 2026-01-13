@@ -912,7 +912,8 @@ def open_or_create_kons_master(excel, kons_master_path: Path, kons_template_path
 
     if not kons_master_path.exists():
         if not kons_template_path.exists():
-            raise RuntimeError(f"Pflichtdatei fehlt: {kons_template_path}")
+            raise RuntimeError(
+                f"Sehr geehrte Damen und Herren, \n es scheint ein Fehler aufgetretetn zu sein. Eine Datei fehlt oder ist beschädigt:\n {kons_template_path}")
 
     if kons_master_path.exists():
         return excel.Workbooks.Open(builtins.str(kons_master_path.resolve()))
