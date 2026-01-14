@@ -227,10 +227,8 @@ def first_num_thousands_safe(v: Any) -> Optional[float]:
     t = t.replace("kg co2e", "").replace("kgco2e", "").replace("co2e", "").replace("kg", "").replace("%", "")
     t = t.strip()
 
-    # Remove spaces used as thousand separators
     t = t.replace(" ", "").replace("\u00A0", "")
 
-    # If it looks like german thousands: 12.000 or 1.234.567 or 12.000,50
     if re.fullmatch(r"[-+]?\d{1,3}(\.\d{3})+(,\d+)?", t):
         t = t.replace(".", "")
         t = t.replace(",", ".")
@@ -271,16 +269,31 @@ def erp_points(crit: str, v: Any, scale: dict) -> int:
     return 0
 
 
+err_text = (
+    "Sehr geehrte Damen und Herren,\n\n"
+    "bei der automatisierten Verarbeitung ist ein Fehler aufgetreten.\n\n"
+    "Eine erforderliche Pflichtdatei konnte nicht gefunden werden oder ist nicht verfügbar\n"
+    "Aus diesem Grund konnte der Prozess nicht vollständig ausgeführt werden.\n"
+    "Bitte prüfen Sie die Vollständigkeit und den Ablageort der Datei und starten Sie den Vorgang anschließend erneut.\n\n"
+    "Vielen Dank für Ihre Unterstützung.\n\n"
+    "Freundliche Grüße\n"
+    "SCM Bot"
+    "{missing_file}"
+)
+
+
 def load_scale(file_scale: Path) -> dict:
     if not file_scale.exists():
-        raise RuntimeError(f"Pflichtdatei fehlt: {file_scale}")
+        raise RuntimeError(err_text.format(missing_file=str(file_scale)))
 
     df = pd.read_excel(file_scale, sheet_name="Skala", header=None)
     out = {}
+
     for i in range(4, len(df)):
         crit = sstr(df.iloc[i, 0])
         if not crit or norm(crit) in ("nan", "none"):
             continue
+
         out[crit] = {
             0: sstr(df.iloc[i, 4]),
             20: sstr(df.iloc[i, 5]),
@@ -289,8 +302,8 @@ def load_scale(file_scale: Path) -> dict:
             80: sstr(df.iloc[i, 8]),
             100: sstr(df.iloc[i, 9]),
         }
-    return out
 
+    return out
 
 def disp_val(val: Any, crit_norm: str, keep: frozenset[str]) -> str:
     if crit_norm in keep:
@@ -311,7 +324,7 @@ def disp_val(val: Any, crit_norm: str, keep: frozenset[str]) -> str:
 
 def suppliers_df(cfg: Config) -> pd.DataFrame:
     if not cfg.file_suppliers.exists():
-        raise RuntimeError(f"Pflichtdatei fehlt: {cfg.file_suppliers}")
+        raise RuntimeError(err_text.format(missing_file=str(cfg.file_suppliers)))
     return pd.read_excel(cfg.file_suppliers, sheet_name="Lieferanten", header=2).dropna(subset=["Lieferant_Name"])
 
 
@@ -342,7 +355,7 @@ def supplier_name(cfg: Config, sid: str) -> Optional[str]:
 
 def erp_dict(cfg: Config, sup_name: str) -> dict:
     if not cfg.file_erp.exists():
-        raise RuntimeError(f"Pflichtdatei fehlt: {cfg.file_erp}")
+        raise RuntimeError(err_text.format(missing_file=str(cfg.file_erp)))
     df = pd.read_excel(cfg.file_erp, sheet_name=sup_name, header=None)
     return dict(zip(df[0][1:], df[1][1:]))
 
@@ -430,6 +443,94 @@ def list_round_answer_files(cfg: Config, rid: str) -> Dict[str, Path]:
 
 
 # =========================
+# EXCEL SESSION (SPEEDUP, SAME OUTPUTS)
+# =========================
+
+class ExcelSession:
+    """
+    Hält genau eine Excel.Application offen und cached Workbooks.
+    Semantik bleibt gleich, nur weniger Start/Stop und weniger COM Overhead.
+    """
+
+    def __init__(self, visible: bool = False):
+        self.visible = visible
+        self.excel = None
+        self._wbs: Dict[str, Any] = {}
+
+    def __enter__(self):
+        self.excel = win32.Dispatch("Excel.Application")
+        self.excel.Visible = self.visible
+        self.excel.DisplayAlerts = False
+        try:
+            self.excel.ScreenUpdating = False
+        except Exception:
+            pass
+        try:
+            self.excel.EnableEvents = False
+        except Exception:
+            pass
+        try:
+            self.excel.AskToUpdateLinks = False
+        except Exception:
+            pass
+        try:
+            self.excel.Calculation = -4105  # xlCalculationManual
+        except Exception:
+            pass
+        return self
+
+    def open_wb(self, path: Path):
+        p = str(path.resolve())
+        wb = self._wbs.get(p)
+        if wb is None:
+            wb = self.excel.Workbooks.Open(p)
+            self._wbs[p] = wb
+        return wb
+
+    def close_wb(self, path: Path, save: bool = True):
+        p = str(path.resolve())
+        wb = self._wbs.pop(p, None)
+        if wb is not None:
+            try:
+                wb.Close(SaveChanges=save)
+            except Exception:
+                pass
+
+    def save_all(self):
+        for wb in list(self._wbs.values()):
+            try:
+                wb.Save()
+            except Exception:
+                pass
+
+    def calculate_full(self):
+        try:
+            self.excel.CalculateFull()
+        except Exception:
+            pass
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.save_all()
+        finally:
+            for wb in list(self._wbs.values()):
+                try:
+                    wb.Close(SaveChanges=True)
+                except Exception:
+                    pass
+            self._wbs.clear()
+            try:
+                self.excel.Calculation = -4107  # xlCalculationAutomatic
+            except Exception:
+                pass
+            try:
+                self.excel.Quit()
+            except Exception:
+                pass
+            self.excel = None
+
+
+# =========================
 # EXCEL / Nutzwertanalyse (zentral + sheet pro Monat/Jahr)
 # =========================
 
@@ -472,7 +573,8 @@ def excel_last_used_row(ws, min_row: int = 2, max_row: int = 1200) -> int:
         a = ws.Cells(r, 1).Value
         d_formula = ws.Cells(r, 4).Formula
         if (a is not None and str(a).strip() != "") or (
-                d_formula is not None and str(d_formula).strip().startswith("=")):
+                d_formula is not None and str(d_formula).strip().startswith("=")
+        ):
             last = r
     return last
 
@@ -484,7 +586,8 @@ def excel_find_rows(ws, start_row=3, max_scan_rows=1200, template_nutzwert_col=4
         a_val = _merged_value(ws.Cells(r, 1))
         b_val = _merged_value(ws.Cells(r, 2))
         text = (builtins.str(a_val) if a_val is not None else "") + " " + (
-            builtins.str(b_val) if b_val is not None else "")
+            builtins.str(b_val) if b_val is not None else ""
+        )
         if "summe nutzwerte" in text.strip().lower():
             sum_row = r
         tmpl = ws.Cells(r, template_nutzwert_col).Formula
@@ -593,19 +696,20 @@ def match_points(rep_map: dict, template_crit: Any) -> int:
     return 0
 
 
-def open_or_create_master(excel, master_path: Path, template_path: Path):
+def open_or_create_master_in_session(sess: ExcelSession, master_path: Path, template_path: Path):
     master_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not master_path.exists():
         if not template_path.exists():
-            raise RuntimeError(f"Pflichtdatei fehlt: {template_path}")
+            raise RuntimeError(err_text.format(missing_file=str(template_path)))
 
     if master_path.exists():
-        wb = excel.Workbooks.Open(builtins.str(master_path.resolve()))
-    else:
-        wb = excel.Workbooks.Open(builtins.str(template_path.resolve()))
-        wb.SaveAs(builtins.str(master_path.resolve()))
-    return wb
+        return sess.open_wb(master_path)
+
+    wb = sess.open_wb(template_path)
+    wb.SaveAs(builtins.str(master_path.resolve()))
+    sess.close_wb(template_path, save=False)
+    return sess.open_wb(master_path)
 
 
 def ensure_sheet_from_template(wb, sheet_name: str):
@@ -666,42 +770,28 @@ def nutz_sheet_has_any_supplier(ws, header_row: int = 1, start_col: int = 3, max
     return False
 
 
-def resolve_period_sheet_name(cfg: Config, base_sheet_name: str) -> str:
+def resolve_period_sheet_name_in_session(cfg: Config, sess: ExcelSession, base_sheet_name: str) -> str:
     base = sanitize_sheet_name(base_sheet_name)
     master_path = cfg.file_nutz_master.resolve()
 
-    excel = win32.Dispatch("Excel.Application")
-    excel.Visible = False
-    excel.DisplayAlerts = False
-    try:
-        wb = open_or_create_master(excel, master_path, cfg.file_nutz_template)
-        try:
-            if not sheet_exists(wb, base):
-                return base
+    wb = open_or_create_master_in_session(sess, master_path, cfg.file_nutz_template)
 
-            ws_base = wb.Worksheets(base)
-            if not nutz_sheet_has_any_supplier(ws_base):
-                return base
+    if not sheet_exists(wb, base):
+        return base
 
-            for i in range(2, 200):
-                cand = sanitize_sheet_name(f"{base}-{i}")
-                if not sheet_exists(wb, cand):
-                    return cand
-                ws_cand = wb.Worksheets(cand)
-                if not nutz_sheet_has_any_supplier(ws_cand):
-                    return cand
+    ws_base = wb.Worksheets(base)
+    if not nutz_sheet_has_any_supplier(ws_base):
+        return base
 
-            raise RuntimeError("Zu viele Perioden-Blätter vorhanden (Suffix-Suche 2..199 erschöpft).")
-        finally:
-            try:
-                wb.Close(SaveChanges=False)
-            except Exception:
-                pass
-    finally:
-        try:
-            excel.Quit()
-        except Exception:
-            pass
+    for i in range(2, 200):
+        cand = sanitize_sheet_name(f"{base}-{i}")
+        if not sheet_exists(wb, cand):
+            return cand
+        ws_cand = wb.Worksheets(cand)
+        if not nutz_sheet_has_any_supplier(ws_cand):
+            return cand
+
+    raise RuntimeError("Zu viele Perioden-Blätter vorhanden (Suffix-Suche 2..199 erschöpft).")
 
 
 COM_BUSY_HRESULTS = {-2147418111, -2147417846, -2147220995}
@@ -722,205 +812,169 @@ def com_call_with_retry(fn, *, tries: int = 9, base_sleep: float = 0.35, label: 
     raise last_exc if last_exc else RuntimeError(f"{label}: Unbekannter Fehler")
 
 
-def upsert_into_master_nutz(cfg: Config, report_xlsx: Path, supplier_name_: str, sheet_name: str) -> Tuple[
-    Path, Optional[float]]:
+def _group_consecutive(rows: List[int]) -> List[List[int]]:
+    """Zerlegt [3,4,5,7,8] -> [[3,4,5],[7,8]]"""
+    if not rows:
+        return []
+    rows = sorted(rows)
+    groups = [[rows[0]]]
+    for r in rows[1:]:
+        if r == groups[-1][-1] + 1:
+            groups[-1].append(r)
+        else:
+            groups.append([r])
+    return groups
+
+
+def upsert_into_master_nutz_in_session(
+        cfg: Config,
+        sess: ExcelSession,
+        wb_nutz,
+        report_xlsx: Path,
+        supplier_name_: str,
+        sheet_name: str
+) -> Tuple[Path, Optional[float]]:
     master_path = cfg.file_nutz_master.resolve()
 
-    def _do_update():
-        excel = win32.Dispatch("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
+    ws = ensure_sheet_from_template(wb_nutz, sheet_name)
+    ws_s = wb_nutz.Worksheets("Schablone")
+
+    criteria_rows, sum_row = excel_find_rows(ws, start_row=3, max_scan_rows=1200, template_nutzwert_col=4)
+    if not criteria_rows:
+        raise RuntimeError("Keine Kriterienzeilen erkannt (Template-Formeln fehlen?).")
+
+    col_bew, col_nutz = excel_find_supplier_column(ws, supplier_name_, header_row=1, start_col=3)
+    if col_bew is None:
+        col_bew, col_nutz = excel_next_free_supplier_column(ws, header_row=1, start_col=3)
+        excel_apply_template_pair_from_schablone(ws, ws_s, col_bew, col_nutz)
+
+        excel_set_value_safe(ws, 1, col_bew, supplier_name_)
+        excel_set_value_safe(ws, 2, col_bew, "Bewertung")
+        excel_set_value_safe(ws, 2, col_nutz, "Nutzwert")
+
+    rep_map = read_report_points(report_xlsx)
+
+    # --- FIX 1: Diese Zeilen NICHT befüllen (wie von dir genannt) ---
+    # (Das sind bei dir die Abschnitts-/Summenzeilen im Template.)
+    SKIP_ROWS = {9, 14, 17, 23, 27}
+
+    rows_to_fill = [r for r in criteria_rows if r not in SKIP_ROWS]
+
+    # --- FIX 2: NICHT als ein großer zusammenhängender Range schreiben, sondern nur in Runs ---
+    # Sonst verschieben sich Werte bei Lücken -> #NV / falsche Zeilen werden befüllt.
+    runs = _group_consecutive(rows_to_fill)
+
+    # Bewertungen blockweise je Run schreiben
+    for run in runs:
+        pts_2d = []
+        for r in run:
+            crit_txt = _merged_value(ws.Cells(r, 1))
+            pts_2d.append([int(match_points(rep_map, crit_txt))])
+
+        ws.Range(ws.Cells(run[0], col_bew), ws.Cells(run[-1], col_bew)).Value = pts_2d
+
+    # Nutzwert-Formeln setzen (hier zeilenweise, aber nur für rows_to_fill)
+    for r in rows_to_fill:
+        w_cell = builtins.str(ws.Cells(r, 2).Address).replace("$", "")
+        b_cell = builtins.str(ws.Cells(r, col_bew).Address).replace("$", "")
+        ws.Cells(r, col_nutz).Formula = f"={w_cell}*{b_cell}"
+
+    if sum_row:
+        set_sum_formula_like_template(ws, ws_s, sum_row, col_bew, col_nutz)
+
+    try:
+        wb_nutz.RefreshAll()
+    except Exception:
+        pass
+    sess.calculate_full()
+
+    sum_val = None
+    if sum_row:
         try:
-            try:
-                excel.ScreenUpdating = False
-            except Exception:
-                pass
-            try:
-                excel.Calculation = -4105
-            except Exception:
-                pass
+            v = ws.Cells(int(sum_row), int(col_bew)).Value
+            sum_val = float(v) if v is not None and builtins.str(v).strip() != "" else None
+        except Exception:
+            sum_val = None
 
-            wb = open_or_create_master(excel, master_path, cfg.file_nutz_template)
-            try:
-                ws = ensure_sheet_from_template(wb, sheet_name)
-                ws_s = wb.Worksheets("Schablone")
-
-                criteria_rows, sum_row = excel_find_rows(ws, start_row=3, max_scan_rows=1200, template_nutzwert_col=4)
-                if not criteria_rows:
-                    raise RuntimeError("Keine Kriterienzeilen erkannt (Template-Formeln fehlen?).")
-
-                col_bew, col_nutz = excel_find_supplier_column(ws, supplier_name_, header_row=1, start_col=3)
-                if col_bew is None:
-                    col_bew, col_nutz = excel_next_free_supplier_column(ws, header_row=1, start_col=3)
-                    excel_apply_template_pair_from_schablone(ws, ws_s, col_bew, col_nutz)
-
-                    excel_set_value_safe(ws, 1, col_bew, supplier_name_)
-                    excel_set_value_safe(ws, 2, col_bew, "Bewertung")
-                    excel_set_value_safe(ws, 2, col_nutz, "Nutzwert")
-
-                rep_map = read_report_points(report_xlsx)
-
-                for r in criteria_rows:
-                    crit_txt = _merged_value(ws.Cells(r, 1))
-                    pts = match_points(rep_map, crit_txt)
-                    ws.Cells(r, col_bew).Value = int(pts)
-
-                    w_cell = builtins.str(ws.Cells(r, 2).Address).replace("$", "")
-                    b_cell = builtins.str(ws.Cells(r, col_bew).Address).replace("$", "")
-                    ws.Cells(r, col_nutz).Formula = f"={w_cell}*{b_cell}"
-
-                if sum_row:
-                    set_sum_formula_like_template(ws, ws_s, sum_row, col_bew, col_nutz)
-
-                try:
-                    wb.RefreshAll()
-                except Exception:
-                    pass
-                try:
-                    excel.CalculateFull()
-                except Exception:
-                    pass
-
-                sum_val = None
-                if sum_row:
-                    try:
-                        v = ws.Cells(int(sum_row), int(col_bew)).Value
-                        sum_val = float(v) if v is not None and builtins.str(v).strip() != "" else None
-                    except Exception:
-                        sum_val = None
-
-                wb.Save()
-                return master_path, sum_val
-
-            finally:
-                try:
-                    wb.Close(SaveChanges=True)
-                except Exception:
-                    pass
-        finally:
-            try:
-                excel.Quit()
-            except Exception:
-                pass
-
-    result_path, sum_val = com_call_with_retry(_do_update, tries=9, base_sleep=0.35,
-                                               label="Excel/Nutzwertanalyse_Master")
-    print(f"[OK] Master-Nutzwertanalyse aktualisiert: {Path(result_path).name} (Sheet: {sheet_name})")
-    return Path(result_path), sum_val
+    wb_nutz.Save()
+    print(f"[OK] Master-Nutzwertanalyse aktualisiert: {Path(master_path).name} (Sheet: {sheet_name})")
+    return Path(master_path), sum_val
 
 
-def apply_trafficlight_to_nutz_sheet(cfg: Config, sheet_name: str, start_cell: str = "C31") -> Path:
+def apply_trafficlight_to_nutz_sheet_in_session(cfg: Config, sess: ExcelSession, wb_nutz, sheet_name: str,
+                                                start_cell: str = "C31") -> Path:
     """
-    Öffnet die zentrale Nutzwertanalyse, wählt das Monatsblatt und setzt für den Bereich
-    ab start_cell (default C31) bis zur letzten belegten Header-Spalte (Row1) eine
-    3-Farb-Skala (Rot-Gelb-Grün) als bedingte Formatierung.
-
-    Bereich = C31 : <last_used_col> <last_used_row>
-    last_used_col wird anhand der belegten Supplier-Header in Zeile 1 ermittelt (paarweise Spalten).
-    last_used_row anhand genutzter Zeilen im Sheet.
+    Wie vorher, nur ohne Excel neu zu starten.
     """
     master_path = cfg.file_nutz_master.resolve()
+    ws = wb_nutz.Worksheets(sanitize_sheet_name(sheet_name))
 
-    def _do_update():
-        excel = win32.Dispatch("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
-        try:
-            try:
-                excel.ScreenUpdating = False
-            except Exception:
-                pass
-            try:
-                excel.Calculation = -4105  # xlCalculationManual
-            except Exception:
-                pass
+    last_col = 2
+    for c in range(3, 401, 2):
+        v = ws.Cells(1, c).Value
+        if v is not None and builtins.str(v).strip() != "":
+            last_col = max(last_col, c + 1)
+    if last_col < 3:
+        wb_nutz.Save()
+        return Path(master_path)
 
-            if not master_path.exists():
-                raise RuntimeError(f"Nutzwertanalyse-Master fehlt: {master_path}")
+    last_row = excel_last_used_row(ws, min_row=31, max_row=1200)
 
-            wb = excel.Workbooks.Open(builtins.str(master_path.resolve()))
-            try:
-                ws = wb.Worksheets(sanitize_sheet_name(sheet_name))
+    start_rng = ws.Range(start_cell)
+    start_row = start_rng.Row
+    start_col = start_rng.Column
 
-                # --- letzte belegte Supplier-Spalte bestimmen (Zeile 1, paarweise Spalten ab C=3) ---
-                last_col = 2
-                for c in range(3, 401, 2):
-                    v = ws.Cells(1, c).Value
-                    if v is not None and builtins.str(v).strip() != "":
-                        last_col = max(last_col, c + 1)  # include Nutzwert-Spalte
-                if last_col < 3:
-                    wb.Save()
-                    return master_path
+    rng = ws.Range(ws.Cells(start_row, start_col), ws.Cells(last_row, last_col))
 
-                # --- letzte genutzte Zeile bestimmen ---
-                last_row = excel_last_used_row(ws, min_row=31, max_row=1200)
+    try:
+        rng.FormatConditions.Delete()
+    except Exception:
+        pass
 
-                # Startcell parsen C31
-                start_rng = ws.Range(start_cell)
-                start_row = start_rng.Row
-                start_col = start_rng.Column
+    fc = rng.FormatConditions.AddColorScale(3)
+    cs = fc.ColorScaleCriteria
 
-                # Zielbereich
-                rng = ws.Range(ws.Cells(start_row, start_col), ws.Cells(last_row, last_col))
+    try:
+        cs(1).Type = 1  # LowestValue
+        cs(2).Type = 5  # Percentile
+        cs(2).Value = 50
+        cs(3).Type = 2  # HighestValue
+    except Exception:
+        pass
 
-                try:
-                    rng.FormatConditions.Delete()
-                except Exception:
-                    pass
+    cs(1).FormatColor.Color = 255
+    cs(2).FormatColor.Color = 65535
+    cs(3).FormatColor.Color = 65280
 
-                # 3-Farb-Skala hinzufügen
-                fc = rng.FormatConditions.AddColorScale(3)
-                cs = fc.ColorScaleCriteria
-
-                try:
-                    cs(1).Type = 1  # LowestValue
-                    cs(2).Type = 5  # Percentile
-                    cs(2).Value = 50
-                    cs(3).Type = 2  # HighestValue
-                except Exception:
-                    pass
-
-                cs(1).FormatColor.Color = 255  # Rot   (RGB(255,0,0))
-                cs(2).FormatColor.Color = 65535  # Gelb  (RGB(255,255,0))
-                cs(3).FormatColor.Color = 65280  # Grün  (RGB(0,255,0))
-
-                wb.Save()
-                return master_path
-            finally:
-                try:
-                    wb.Close(SaveChanges=True)
-                except Exception:
-                    pass
-        finally:
-            try:
-                excel.Quit()
-            except Exception:
-                pass
-
-    result = com_call_with_retry(_do_update, tries=9, base_sleep=0.35,
-                                 label="Excel/Nutzwertanalyse_ConditionalFormatting")
-    print(f"[OK] Bedingte Formatierung gesetzt: {Path(result).name} (Sheet: {sheet_name}, ab {start_cell})")
-    return Path(result)
+    wb_nutz.Save()
+    print(f"[OK] Bedingte Formatierung gesetzt: {Path(master_path).name} (Sheet: {sheet_name}, ab {start_cell})")
+    return Path(master_path)
 
 
 # =========================
 # KONSOLIDIERUNG
 # =========================
 
-def open_or_create_kons_master(excel, kons_master_path: Path, kons_template_path: Path):
+def open_or_create_kons_master_in_session(sess: ExcelSession, kons_master_path: Path, kons_template_path: Path):
     kons_master_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not kons_master_path.exists():
         if not kons_template_path.exists():
             raise RuntimeError(
-                f"Sehr geehrte Damen und Herren, \n es scheint ein Fehler aufgetretetn zu sein. Eine Datei fehlt oder ist beschädigt:\n {kons_template_path} \n Bitte um Korrektur und erneuten Start der Evaluation! \n Viele Grüße,\n SCM-BOT")
+                f"Sehr geehrte Damen und Herren,\n"
+                f"es scheint ein Fehler aufgetreten zu sein. Eine Datei fehlt oder ist beschädigt:\n"
+                f"{kons_template_path}\n"
+                f"Bitte um Korrektur und erneuten Start der Evaluation!\n"
+                f"Viele Grüße,\nSCM-BOT"
+            )
 
     if kons_master_path.exists():
-        return excel.Workbooks.Open(builtins.str(kons_master_path.resolve()))
+        return sess.open_wb(kons_master_path)
 
-    wb = excel.Workbooks.Open(builtins.str(kons_template_path.resolve()))
+    wb = sess.open_wb(kons_template_path)
     wb.SaveAs(builtins.str(kons_master_path.resolve()))
-    return wb
+    sess.close_wb(kons_template_path, save=False)
+    return sess.open_wb(kons_master_path)
 
 
 def ensure_template_sheet_exists(wb, template_sheet_name: str = "Schablone"):
@@ -1015,70 +1069,32 @@ def last_used_period_col(ws, row_period: int = 2, start_col: int = 2, max_cols: 
     return last
 
 
-def update_supplier_konsolidierung(cfg: Config, supplier_name_: str, period: str, value: Optional[float]) -> Path:
-    kons_master_path = cfg.file_kons_master.resolve()
-    kons_template_path = cfg.file_kons_template.resolve()
+def update_supplier_konsolidierung_in_session(cfg: Config, sess: ExcelSession, wb_kons, supplier_name_: str,
+                                              period: str, value: Optional[float]) -> Path:
+    ws = ensure_supplier_sheet_from_kons_template(wb_kons, supplier_name_, template_sheet_name="Schablone")
+    col = find_or_create_period_column(ws, period, row_period=2, start_col=2, max_cols=400)
 
-    def _do_update():
-        excel = win32.Dispatch("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
-        try:
-            try:
-                excel.ScreenUpdating = False
-            except Exception:
-                pass
-            try:
-                excel.Calculation = -4105
-            except Exception:
-                pass
+    ws.Cells(3, col).Value = "" if value is None else float(value)
 
-            wb = open_or_create_kons_master(excel, kons_master_path, kons_template_path)
-            try:
-                ws = ensure_supplier_sheet_from_kons_template(wb, supplier_name_, template_sheet_name="Schablone")
+    last_col = last_used_period_col(ws, row_period=2, start_col=2, max_cols=400)
+    if last_col >= 2:
+        start_cell = ws.Cells(3, 2).Address.replace("$", "")
+        end_cell = ws.Cells(3, last_col).Address.replace("$", "")
+        rng = f"{start_cell}:{end_cell}"
+        ws.Cells(5, 2).Formula = f'=IF(COUNT({rng})=0,"",AVERAGE({rng}))'
+    else:
+        ws.Cells(5, 2).Formula = ""
 
-                col = find_or_create_period_column(ws, period, row_period=2, start_col=2, max_cols=400)
+    try:
+        wb_kons.RefreshAll()
+    except Exception:
+        pass
+    sess.calculate_full()
+    wb_kons.Save()
 
-                if value is None:
-                    ws.Cells(3, col).Value = ""
-                else:
-                    ws.Cells(3, col).Value = float(value)
-
-                last_col = last_used_period_col(ws, row_period=2, start_col=2, max_cols=400)
-                if last_col >= 2:
-                    start_cell = ws.Cells(3, 2).Address.replace("$", "")
-                    end_cell = ws.Cells(3, last_col).Address.replace("$", "")
-                    rng = f"{start_cell}:{end_cell}"
-                    ws.Cells(5, 2).Formula = f'=IF(COUNT({rng})=0,"",AVERAGE({rng}))'
-                else:
-                    ws.Cells(5, 2).Formula = ""
-
-                try:
-                    wb.RefreshAll()
-                except Exception:
-                    pass
-                try:
-                    excel.CalculateFull()
-                except Exception:
-                    pass
-
-                wb.Save()
-                return kons_master_path
-
-            finally:
-                try:
-                    wb.Close(SaveChanges=True)
-                except Exception:
-                    pass
-        finally:
-            try:
-                excel.Quit()
-            except Exception:
-                pass
-
-    result = com_call_with_retry(_do_update, tries=9, base_sleep=0.35, label="Excel/Konsolidierung_Supplier")
-    print(f"[OK] Konsolidierung aktualisiert: {Path(result).name} | {supplier_name_} | {period}")
-    return Path(result)
+    print(
+        f"[OK] Konsolidierung aktualisiert: {Path(cfg.file_kons_master.resolve()).name} | {supplier_name_} | {period}")
+    return cfg.file_kons_master.resolve()
 
 
 # =========================
@@ -1253,8 +1269,17 @@ def phase_send_links(cfg: Config, outlook: OutlookUI, sent: Dict[str, dict], rou
         print(f"[OK] Bewertungslink zu {lname} an {email}")
 
 
-def ingest_existing_round_answers(cfg: Config, scale: dict, sent: Dict[str, dict],
-                                  round_id: str, sheet_name: str, got: set) -> None:
+def ingest_existing_round_answers(
+        cfg: Config,
+        scale: dict,
+        sent: Dict[str, dict],
+        round_id: str,
+        sheet_name: str,
+        got: set,
+        sess: ExcelSession,
+        wb_nutz,
+        wb_kons
+) -> None:
     if not sent:
         return
 
@@ -1278,16 +1303,26 @@ def ingest_existing_round_answers(cfg: Config, scale: dict, sent: Dict[str, dict
 
         sup = supplier_name(cfg, sid)
         if sup:
-            _, sum_val = upsert_into_master_nutz(cfg, report, sup, sheet_name)
-            update_supplier_konsolidierung(cfg, sup, sheet_name, sum_val)
+            _, sum_val = upsert_into_master_nutz_in_session(cfg, sess, wb_nutz, report, sup, sheet_name)
+            update_supplier_konsolidierung_in_session(cfg, sess, wb_kons, sup, sheet_name, sum_val)
 
         got.add(sid)
         print(status_text(sent, got, round_id))
 
 
-def phase_poll_folder(cfg: Config, outlook: OutlookUI, scale: dict,
-                      sent: Dict[str, dict], round_id: str, sheet_name: str,
-                      folder="rpa_supplier_evaluation", poll=10):
+def phase_poll_folder(
+        cfg: Config,
+        outlook: OutlookUI,
+        scale: dict,
+        sent: Dict[str, dict],
+        round_id: str,
+        sheet_name: str,
+        sess: ExcelSession,
+        wb_nutz,
+        wb_kons,
+        folder="rpa_supplier_evaluation",
+        poll=10
+):
     print(f"\n[PHASE 2] Polling Ordner '{folder}' (Runde {round_id}) ...")
     round_id_l = round_id.lower()
     outlook.open_folder(folder)
@@ -1302,13 +1337,13 @@ def phase_poll_folder(cfg: Config, outlook: OutlookUI, scale: dict,
         m_s = re.search(r"\b(K_\d+)\b", t, flags=re.I)
         return (m_r.group(1) if m_r else None), (m_s.group(1).upper() if m_s else None)
 
-    ingest_existing_round_answers(cfg, scale, sent, round_id, sheet_name, got)
+    ingest_existing_round_answers(cfg, scale, sent, round_id, sheet_name, got, sess, wb_nutz, wb_kons)
     if all_done(sent, got):
         print(f"\n[OK] Alle Antworten lagen bereits als Dateien vor. {status_text(sent, got, round_id)}")
         return got
 
     while not all_done(sent, got):
-        ingest_existing_round_answers(cfg, scale, sent, round_id, sheet_name, got)
+        ingest_existing_round_answers(cfg, scale, sent, round_id, sheet_name, got, sess, wb_nutz, wb_kons)
         if all_done(sent, got):
             break
 
@@ -1374,14 +1409,17 @@ def phase_poll_folder(cfg: Config, outlook: OutlookUI, scale: dict,
 
             sup = supplier_name(cfg, sid)
             if sup:
-                _, sum_val = upsert_into_master_nutz(cfg, report, sup, sheet_name)
-                update_supplier_konsolidierung(cfg, sup, sheet_name, sum_val)
+                _, sum_val = upsert_into_master_nutz_in_session(cfg, sess, wb_nutz, report, sup, sheet_name)
+                update_supplier_konsolidierung_in_session(cfg, sess, wb_kons, sup, sheet_name, sum_val)
 
             got.add(sid)
             print(status_text(sent, got, round_id))
 
             outlook.archive_current_mail()
             processed = True
+
+            # Optional: zwischenspeichern, damit bei Abbruch nichts verloren geht
+            sess.save_all()
             break
 
         if not processed:
@@ -1451,21 +1489,34 @@ def main():
         outlook = OutlookUI(page)
 
         try:
-            sheet_name = resolve_period_sheet_name(cfg, base_sheet)
-            print(f"[INFO] Nutzwertanalyse-Blatt: {sheet_name}")
-
             scale = load_scale(cfg.file_scale)
             sent = build_sent_meta(cfg, round_id)
 
-            phase_send_links(cfg, outlook, sent, round_id)
-            got = phase_poll_folder(cfg, outlook, scale, sent, round_id, sheet_name, folder="rpa_supplier_evaluation",
-                                    poll=10)
+            # Excel nur einmal starten und Master-WBs offen halten
+            with ExcelSession(visible=False) as sess:
+                wb_nutz = open_or_create_master_in_session(sess, cfg.file_nutz_master.resolve(),
+                                                           cfg.file_nutz_template.resolve())
+                wb_kons = open_or_create_kons_master_in_session(sess, cfg.file_kons_master.resolve(),
+                                                                cfg.file_kons_template.resolve())
 
-            if all_done(sent, got):
-                apply_trafficlight_to_nutz_sheet(cfg, sheet_name, start_cell="C31")
-                phase_send_final(cfg, outlook, round_id, sheet_name)
-            else:
-                print(f"[WARN] Nicht alle Antworten da, keine Abschlussmail. {status_text(sent, got, round_id)}")
+                sheet_name = resolve_period_sheet_name_in_session(cfg, sess, base_sheet)
+                print(f"[INFO] Nutzwertanalyse-Blatt: {sheet_name}")
+
+                phase_send_links(cfg, outlook, sent, round_id)
+
+                got = phase_poll_folder(
+                    cfg, outlook, scale, sent, round_id, sheet_name,
+                    sess, wb_nutz, wb_kons,
+                    folder="rpa_supplier_evaluation",
+                    poll=10
+                )
+
+                if all_done(sent, got):
+                    apply_trafficlight_to_nutz_sheet_in_session(cfg, sess, wb_nutz, sheet_name, start_cell="C31")
+                    sess.save_all()
+                    phase_send_final(cfg, outlook, round_id, sheet_name)
+                else:
+                    print(f"[WARN] Nicht alle Antworten da, keine Abschlussmail. {status_text(sent, got, round_id)}")
 
         except Exception as e:
             tb = traceback.format_exc()
